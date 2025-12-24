@@ -13,26 +13,49 @@ import os
 # ============================================================
 # Collect ROOT files
 # ============================================================
-base_dir = "/media/miguel/Elements_2024/ePIC_feb2025_campaign/NC_DIS_18x275/minQ2_100_clustersonly"
+R=1.0
+base_dir = "/media/miguel/Expansion/ePIC_feb2025_campaign/NC_DIS_18x275/"
 
-# Collect all .root files directly in this directory
 root_files = [
-    os.path.join(base_dir, f)
-    for f in os.listdir(base_dir)
-    if f.endswith(".root")
+    os.path.join(dirpath, filename)
+    for dirpath, _, filenames in os.walk(base_dir)
+    for filename in filenames
+    if filename.endswith(".root")
 ]
 
 print(f"Found {len(root_files)} ROOT files in {base_dir}")
 
-events_list = []
-for i, f in enumerate(root_files, 1):
-    if i % 20 == 0 or i == len(root_files):
-        print(f"[{i}/{len(root_files)}] Loaded up to {f}")
-    events_list.append(ur.open(f)["events"])
-
-print(f"Loaded {len(events_list)} ROOT files total")
 
 
+
+# ============================================================
+# Helper Functions
+# ============================================================
+
+def rotateY(xdata, zdata, angle):
+    s = np.sin(angle)
+    c = np.cos(angle)
+    rotatedz = c * zdata - s * xdata
+    rotatedx = s * zdata + c * xdata
+    return rotatedx, rotatedz
+
+
+def eta(px, py, pz):
+    pT = np.sqrt(px**2 + py**2)
+    theta = np.arctan2(pT, pz)
+    return -np.log(np.tan(theta / 2))
+
+
+def phi(x, y):
+    return np.arctan2(y, x)
+
+
+def momentum_xyz(px, py, pz):
+    norm = np.sqrt(px**2 + py**2 + pz**2)
+    x = px / norm
+    y = py / norm
+    z = pz / norm
+    return x, y, z
 
 # ============================================================
 # Helper Functions
@@ -42,20 +65,24 @@ def configure_plotting():
     plt.rcParams['savefig.facecolor'] = 'white'
     plt.rcParams['savefig.bbox'] = 'tight'
 
+
 def rotateY(xdata, zdata, angle):
     s = np.sin(angle)
     c = np.cos(angle)
-    rotatedz = c*zdata - s*xdata
-    rotatedx = s*zdata + c*xdata
+    rotatedz = c * zdata - s * xdata
+    rotatedx = s * zdata + c * xdata
     return rotatedx, rotatedz
+
 
 def eta(px, py, pz):
     pT = np.sqrt(px**2 + py**2)
     theta = np.arctan2(pT, pz)
     return -np.log(np.tan(theta / 2))
 
-def phi(x,y):
+
+def phi(x, y):
     return np.arctan2(y, x)
+
 
 def momentum_xyz(px, py, pz):
     norm = np.sqrt(px**2 + py**2 + pz**2)
@@ -64,59 +91,117 @@ def momentum_xyz(px, py, pz):
     z = pz / norm
     return x, y, z
 
+
 def jet_dict_ak(px, py, pz, e, minE, minHitE=0.0, etaMin=2.5, etaMax=4):
+    # --- Preselection ---
     hit_eta = eta(px, py, pz)
     mask = (e >= minHitE)
     px, py, pz, e = px[mask], py[mask], pz[mask], e[mask]
 
-    momenta = ak.zip(
+    # --- Build momentum records ---
+    array = ak.zip(
         {"px": px, "py": py, "pz": pz, "E": e},
         with_name="Momentum4D",
         behavior=ak.behavior
     )
 
-    jetdef = fastjet.JetDefinition(fastjet.antikt_algorithm, 0.4)
-    cluster = fastjet.ClusterSequence(momenta, jetdef)
-    inc_jets = cluster.inclusive_jets()
+    # --- Jet clustering ---
+    jetdef = fastjet.JetDefinition(fastjet.antikt_algorithm, R)
+    cluster = fastjet.ClusterSequence(array, jetdef)
 
-    jeta = eta(inc_jets.px, inc_jets.py, inc_jets.pz)
-    jphi = phi(inc_jets.px, inc_jets.py)
-    cut = (inc_jets.E >= minE) & (jeta >= etaMin) & (jeta <= etaMax)
+    # Get all jets (no pT cut yet)
+    jets = cluster.inclusive_jets()
+    constituents = cluster.constituents()
 
+    # --- Compute pt for jets ---
+    jets["pt"] = np.sqrt(jets["px"] ** 2 + jets["py"] ** 2)
+
+    # --- Apply cuts ---
+    jeta = eta(jets.px, jets.py, jets.pz)
+    jphi = phi(jets.px, jets.py)
+    cut = (
+        (jets.E >= minE)
+        & (jeta >= etaMin)
+        & (jeta <= etaMax)
+    )
+
+    # Apply the same mask to jets and constituents
+    jets = jets[cut]
+    constituents = constituents[cut]
+    jeta = eta(jets.px, jets.py, jets.pz)
+    jphi = phi(jets.px, jets.py)
+    # --- Return full dict ---
     return {
-        "energy": inc_jets.E[cut],
-        "eta": jeta[cut],
-        "phi": jphi[cut]
+        "energy": jets.E,
+        "eta": jeta,
+        "phi": jphi,
+        "pt": jets.pt,
+        "constituents": constituents
     }
 
+
+
 def jets_to_df(jets_dict, start_event=0):
+    # Ensure we have something to process
     if any(len(jets_dict[key]) == 0 for key in ['energy', 'eta', 'phi']):
-        return pd.DataFrame(columns=['energy', 'eta', 'phi', 'event'])
+        return pd.DataFrame(columns=['energy', 'eta', 'phi', 'event', 'constituents'])
 
     num_events = len(jets_dict['energy'])
+    if num_events == 0:
+        return pd.DataFrame(columns=['energy', 'eta', 'phi', 'event', 'constituents'])
+
+    # Generate event numbers aligned to each jet
     event_numbers = ak.concatenate(
         [ak.full_like(jets_dict['energy'][i], start_event + i, dtype=int) for i in range(num_events)]
-    ) if num_events > 0 else ak.Array([])
+    )
 
-    if len(event_numbers) == 0:
-        return pd.DataFrame(columns=['energy', 'eta', 'phi', 'event'])
-
+    # Flatten per-jet data
     energy_flat = ak.flatten(jets_dict['energy'])
     eta_flat = ak.flatten(jets_dict['eta'])
     phi_flat = ak.flatten(jets_dict['phi'])
 
+    # --- Flatten constituents ---
+    # Each entry in jets_dict['constituents'] corresponds to a jet → a list of particles
+    # We'll convert each jet’s constituent list into a JSON string for DataFrame storage
+    constituent_list = []
+    if "constituents" in jets_dict:
+        for jet_const in ak.flatten(jets_dict["constituents"]):
+            if len(jet_const) == 0:
+                constituent_list.append(None)
+            else:
+                # Extract px, py, pz, E into a serializable structure
+                const_px = ak.to_list(jet_const.px)
+                const_py = ak.to_list(jet_const.py)
+                const_pz = ak.to_list(jet_const.pz)
+                const_E  = ak.to_list(jet_const.E)
+                constituent_list.append({
+                    "px": const_px,
+                    "py": const_py,
+                    "pz": const_pz,
+                    "E":  const_E
+                })
+    else:
+        constituent_list = [None] * len(energy_flat)
+
+    # --- Build DataFrame ---
     return pd.DataFrame({
         'energy': energy_flat.to_numpy(),
         'eta': eta_flat.to_numpy(),
         'phi': phi_flat.to_numpy(),
-        'event': event_numbers.to_numpy()
+        'event': event_numbers.to_numpy(),
+        'constituents': constituent_list
     })
+
+
 
 # ============================================================
 # Main Jet Matching Loop
 # ============================================================
 truth_dfs = []
 reco_dfs = []
+truth_constituents = []
+reco_constituents = []
+
 event_counter = 0
 
 cluster_names = [
@@ -126,13 +211,14 @@ cluster_names = [
     "HcalEndcapPInsertClusters/HcalEndcapPInsertClusters"
 ]
 
-for file_idx, events in enumerate(events_list):
-    total_files = len(events_list)
-    if file_idx % max(1, total_files // 100) == 0:
-        percent = (file_idx / total_files) * 100
-        print(f"Processing files: {percent:.1f}% ({file_idx}/{total_files})")
+for idx, fpath in enumerate(root_files, 1):
+
+
+    print(f"[{idx}/{len(root_files)}] Processing {os.path.basename(fpath)}")
+
 
     try:
+        events = ur.open(fpath)["events"]
         # --- Truth momenta ---
         gen_status = events["MCParticles/MCParticles.generatorStatus"].array(library="ak")
 
@@ -151,7 +237,7 @@ for file_idx, events in enumerate(events_list):
 
         truth_jets = jet_dict_ak(
             px_rot, py_truth, pz_rot, e_truth,
-            minHitE=0.0, minE=30, etaMin=3.0, etaMax=4.0
+            minHitE=0.0, minE=0, etaMin=3.0, etaMax=4.0
         )
 
         # --- Reco ---
@@ -174,7 +260,7 @@ for file_idx, events in enumerate(events_list):
 
         reco_jets = jet_dict_ak(
             ak.Array(px_rot), ak.Array(py_reco), ak.Array(pz_rot), ak.Array(e_all),
-            minHitE=1.5, minE=25, etaMin=3, etaMax=4.0
+            minHitE=1.5, minE=0, etaMin=3, etaMax=4.0
         )
 
         # Convert to DataFrames
@@ -186,8 +272,9 @@ for file_idx, events in enumerate(events_list):
 
         event_counter += len(truth_jets['energy'])
 
+
     except Exception as e:
-        print(f"⚠️ Error processing events in file index {file_idx}: {e}")
+        print(f"⚠️ Error processing events in file index {idx}: {e}")
         continue
 
 # ============================================================
@@ -201,16 +288,16 @@ truth_df["truth_idx"] = truth_df.groupby("event").cumcount()
 
 pairs = reco_df.merge(truth_df, on="event", suffixes=("_reco", "_truth"))
 pairs["deta"] = pairs["eta_reco"] - pairs["eta_truth"]
-pairs["dphi"] = (pairs["phi_reco"] - pairs["phi_truth"] + np.pi) % (2*np.pi) - np.pi
-pairs["deltaR"] = np.sqrt(pairs["deta"]**2 + pairs["dphi"]**2)
+pairs["dphi"] = (pairs["phi_reco"] - pairs["phi_truth"] + np.pi) % (2 * np.pi) - np.pi
+pairs["deltaR"] = np.sqrt(pairs["deta"] ** 2 + pairs["dphi"] ** 2)
 
 closest_pairs = (
     pairs.loc[pairs.groupby(["event", "reco_idx"])["deltaR"].idxmin()]
-         .sort_values(["event", "deltaR"])
-         .drop_duplicates(subset=["event", "truth_idx"], keep="first")
-         .drop_duplicates(subset=["event", "reco_idx"], keep="first")
+    .sort_values(["event", "deltaR"])
+    .drop_duplicates(subset=["event", "truth_idx"], keep="first")
+    .drop_duplicates(subset=["event", "reco_idx"], keep="first")
 )
-closest_pairs = closest_pairs[closest_pairs["deltaR"] <= 0.4]
+closest_pairs = closest_pairs[closest_pairs["deltaR"] <= R/2]
 
 paired_reco = set(zip(closest_pairs["event"], closest_pairs["reco_idx"]))
 paired_truth = set(zip(closest_pairs["event"], closest_pairs["truth_idx"]))
@@ -230,6 +317,5 @@ data_dict = {
     "unpaired_truth": unpaired_truth
 }
 
-pd.to_pickle(data_dict, "jets_Q2_100.pkl")
+pd.to_pickle(data_dict, "jets_R1_E0_halfR.pkl")
 print(f"✅ Finished. Total events processed: {event_counter}")
-
